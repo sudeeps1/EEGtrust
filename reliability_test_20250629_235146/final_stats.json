@@ -1,0 +1,12 @@
+{
+  "total_runtime": 78.68478155136108,
+  "windows_processed": 0,
+  "avg_inference_time_ms": 0.0,
+  "alert_manager_stats": {
+    "total_predictions": 0,
+    "positive_predictions": 0,
+    "alerts_triggered": 0,
+    "alert_rate": 0.0
+  },
+  "alerts": []
+}
