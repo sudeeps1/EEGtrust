@@ -123,19 +123,6 @@ python scripts/export_onnx.py
 - `scripts/train_with_existing_data.py` is the maintained practical training path.
 - `eegtrust/train.py` contains reusable training functions and legacy code paths; its default `prepare_data()` flow is intentionally guarded and not the primary entrypoint.
 
-## Troubleshooting
-
-- **`ModuleNotFoundError` for `numpy` or `torch`**  
-  Confirm you activated your virtual environment and installed dependencies from `requirements.txt`.
-
-- **Tests fail with `prepared_data` not found**  
-  Create/populate the `prepared_data/` directory with expected `*_windows.npy` and `*_labels.npy` files.
-
-- **Slow training / high CPU usage**  
-  Prefer GPU when available and avoid running heavy dashboard processes in parallel with training.
-
-- **Real-time script cannot find model**  
-  Ensure `best_model.pth` exists at repo root, or update script arguments/path accordingly.
 
 ## Additional Documentation
 
