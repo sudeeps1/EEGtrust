@@ -12,14 +12,30 @@ from torch.utils.data import DataLoader, Dataset, random_split, WeightedRandomSa
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score, f1_score
 import os
 import sys
+import random
+import bisect
+import contextlib
 from tqdm import tqdm
-import mmap
 
 # Add the parent directory to the path to import eegtrust modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eegtrust.model import SSLPretrainedEncoder, STGNN, NeuroSymbolicExplainer, FocalLoss
 from eegtrust.config import WINDOW_SIZE_SAMPLES, SAMPLE_RATE
+
+DEFAULT_SEED = 42
+
+
+def set_determinism(seed: int = DEFAULT_SEED):
+    """Enable deterministic and reproducible execution across workers/devices."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 class MemoryEfficientEEGDataset(Dataset):
     """Memory-efficient dataset that loads data on-demand"""
@@ -34,58 +50,47 @@ class MemoryEfficientEEGDataset(Dataset):
         self.data_files = data_files
         self.label_files = label_files
         self.transform = transform
+        self._labels_memmap = [np.load(label_file, mmap_mode='r') for label_file in label_files]
+        self._windows_memmap = [None] * len(data_files)
         
-        # Calculate total length and file offsets
+        # Calculate total length
         self.lengths = []
-        self.offsets = [0]
         
         for data_file in data_files:
-            # Load just the shape info without loading the full array
-            with open(data_file, 'rb') as f:
-                # Read numpy header to get shape
-                magic = np.frombuffer(f.read(8), dtype=np.uint8)
-                if magic[0] != 0x93 or magic[1] != 0x4E:  # Check magic number
-                    raise ValueError(f"Invalid numpy file: {data_file}")
-                
-                # Read header length
-                header_len = np.frombuffer(f.read(2), dtype=np.uint16)[0]
-                header = f.read(header_len).decode('latin1')
-                
-                # Parse shape from header
-                shape_str = header.split("'shape': (")[1].split(")")[0]
-                shape = tuple(int(x.strip()) for x in shape_str.split(','))
-                self.lengths.append(shape[0])
-                self.offsets.append(self.offsets[-1] + shape[0])
+            self.lengths.append(np.load(data_file, mmap_mode='r').shape[0])
+
+        self._cumulative_lengths = np.cumsum(self.lengths, dtype=np.int64)
         
         self.total_length = sum(self.lengths)
         print(f"Dataset initialized with {self.total_length} samples across {len(data_files)} files")
+
+    def _locate_index(self, idx: int):
+        file_idx = bisect.bisect_right(self._cumulative_lengths, idx)
+        prev_cum = 0 if file_idx == 0 else int(self._cumulative_lengths[file_idx - 1])
+        return file_idx, idx - prev_cum
+
+    def get_label_by_global_idx(self, idx: int) -> int:
+        """Fast label lookup without loading full window data."""
+        file_idx, local_idx = self._locate_index(idx)
+        if 0 <= file_idx < len(self._labels_memmap):
+            return int(self._labels_memmap[file_idx][local_idx])
+        raise IndexError(f"Index out of range: {idx}")
     
     def __len__(self):
         return self.total_length
     
     def __getitem__(self, idx):
-        # Find which file contains this index
-        file_idx = 0
-        local_idx = idx
-        
-        for i, length in enumerate(self.lengths):
-            if local_idx < length:
-                file_idx = i
-                break
-            local_idx -= length
-        
         # Load the specific sample from the file
         try:
-            # Load windows file
-            windows = np.load(self.data_files[file_idx], mmap_mode='r')
-            window = windows[local_idx].copy()  # Copy to avoid memory mapping issues
-            
-            # Load labels file
-            labels = np.load(self.label_files[file_idx], mmap_mode='r')
-            label = int(labels[local_idx])
+            file_idx, local_idx = self._locate_index(idx)
+            if self._windows_memmap[file_idx] is None:
+                self._windows_memmap[file_idx] = np.load(self.data_files[file_idx], mmap_mode='r')
+
+            window = np.asarray(self._windows_memmap[file_idx][local_idx], dtype=np.float32)
+            label = int(self._labels_memmap[file_idx][local_idx])
             
             # Convert to tensor
-            window = torch.tensor(window, dtype=torch.float32)
+            window = torch.from_numpy(window)
             label = torch.tensor(label, dtype=torch.long)
             
             if self.transform:
@@ -135,7 +140,10 @@ def get_data_info():
     
     print(f"Total samples: {total_samples}")
     print(f"Class distribution: {class_counts}")
-    print(f"Class imbalance ratio: {class_counts[0] / class_counts[1]:.2f}:1")
+    if class_counts[1] > 0:
+        print(f"Class imbalance ratio: {class_counts[0] / class_counts[1]:.2f}:1")
+    else:
+        print("Class imbalance ratio: inf (no seizure samples found)")
     
     return data_files, label_files, total_samples, class_counts
 
@@ -150,41 +158,39 @@ def calculate_class_weights(class_counts):
     print(f"Class weights: {class_weights}")
     return class_weights
 
-def create_weighted_sampler(dataset, class_counts):
+def create_weighted_sampler(dataset, class_counts, seed: int = DEFAULT_SEED):
     """Create weighted random sampler for oversampling minority class"""
     # Calculate sampling weights
     total_samples = sum(class_counts.values())
     class_weights = [total_samples / class_counts[i] for i in range(2)]
     
-    # Instead of calculating weights for each sample individually,
-    # we'll use a more efficient approach with indices
-    class_indices = {0: [], 1: []}
-    
-    # Get indices for each class (this is faster than checking each sample)
+    sample_weights = np.empty(len(dataset), dtype=np.float32)
     print("Creating weighted sampler...")
-    for i in range(len(dataset)):
-        if i % 10000 == 0:  # Progress indicator
-            print(f"  Processing sample {i}/{len(dataset)}")
-        _, label = dataset[i]
-        class_indices[int(label)].append(i)
-    
-    # Create sample weights array
-    sample_weights = [0] * len(dataset)
-    for class_label, indices in class_indices.items():
-        weight = class_weights[class_label]
-        for idx in indices:
-            sample_weights[idx] = weight
+    if hasattr(dataset, "indices") and hasattr(dataset, "dataset"):
+        base_dataset = dataset.dataset
+        for i, global_idx in enumerate(dataset.indices):
+            if i % 10000 == 0:
+                print(f"  Processing sample {i}/{len(dataset.indices)}")
+            label = base_dataset.get_label_by_global_idx(global_idx)
+            sample_weights[i] = class_weights[int(label)]
+    else:
+        for i in range(len(dataset)):
+            if i % 10000 == 0:
+                print(f"  Processing sample {i}/{len(dataset)}")
+            _, label = dataset[i]
+            sample_weights[i] = class_weights[int(label)]
     
     sampler = WeightedRandomSampler(
-        weights=sample_weights,
+        weights=torch.from_numpy(sample_weights),
         num_samples=len(sample_weights),
-        replacement=True
+        replacement=True,
+        generator=torch.Generator().manual_seed(seed),
     )
     
     print(f"Created weighted sampler with weights: {class_weights}")
     return sampler
 
-def train_model(data_files, label_files, class_counts, device='cuda', epochs=50, batch_size=16, use_focal_loss=True):
+def train_model(data_files, label_files, class_counts, device='cuda', epochs=50, batch_size=16, use_focal_loss=True, seed: int = DEFAULT_SEED):
     """Train the EEGTrust model with class imbalance handling"""
     
     # Create memory-efficient dataset
@@ -196,22 +202,31 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
     val_size = int(0.15 * total_size)
     test_size = total_size - train_size - val_size
     
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, [train_size, val_size, test_size]
-    )
+    split_generator = torch.Generator().manual_seed(seed)
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size], generator=split_generator)
     
     # Create weighted sampler for the training set
-    weighted_sampler = create_weighted_sampler(train_dataset, class_counts)
+    weighted_sampler = create_weighted_sampler(train_dataset, class_counts, seed=seed)
     
     # Create data loaders - use weighted sampler for training
+    is_cuda = str(device).startswith("cuda")
+    num_workers = min(8, os.cpu_count() or 1)
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": is_cuda,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         sampler=weighted_sampler,
-        num_workers=0
+        **loader_kwargs
     )
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
     
     # Get sample to determine dimensions
     sample_window, _ = dataset[0]
@@ -234,6 +249,7 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
     # Setup training
     params = list(encoder.parameters()) + list(stgnn.parameters()) + list(explainer.parameters())
     optimizer = optim.Adam(params, lr=1e-3)
+    scaler = torch.cuda.amp.GradScaler(enabled=is_cuda)
     
     # Setup loss function
     if use_focal_loss:
@@ -254,6 +270,14 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
     print(f"Val samples: {len(val_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
     print(f"Batch size: {batch_size}")
+    print(f"DataLoader workers: {num_workers}")
+
+    def forward_logits(xb):
+        features = encoder(xb)
+        features_seq = features.unsqueeze(1)
+        stgnn_logits = stgnn(features_seq)
+        explainer_logits = explainer(features)
+        return (stgnn_logits + explainer_logits) / 2
     
     for epoch in range(epochs):
         # Training
@@ -266,33 +290,23 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
         train_labels = []
         
         for batch_idx, (x, y) in enumerate(tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')):
-            x, y = x.to(device), y.to(device)
+            x = x.to(device, non_blocking=is_cuda)
+            y = y.to(device, non_blocking=is_cuda)
             
-            optimizer.zero_grad()
-            
-            # Forward pass - Dual Head Architecture
-            features = encoder(x)  # (batch, hidden_dim)
-            features_seq = features.unsqueeze(1)  # (batch, 1, hidden_dim)
-            
-            # STGNN head
-            stgnn_logits = stgnn(features_seq)  # (batch, 2)
-            
-            # NeuroSymbolicExplainer head
-            explainer_logits = explainer(features)  # (batch, 2)
-            
-            # Combine both heads (ensemble)
-            logits = (stgnn_logits + explainer_logits) / 2  # (batch, 2)
-            
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with (torch.cuda.amp.autocast() if is_cuda else contextlib.nullcontext()):
+                logits = forward_logits(x)
+                loss = criterion(logits, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             train_loss += loss.item()
             
             # Store predictions for metrics
-            _, predicted = torch.max(logits.data, 1)
+            predicted = torch.argmax(logits.detach(), dim=1)
             train_predictions.extend(predicted.cpu().numpy())
-            train_labels.extend(y.cpu().numpy())
+            train_labels.extend(y.detach().cpu().numpy())
         
         train_loss /= len(train_loader)
         
@@ -312,30 +326,19 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
         
         with torch.no_grad():
             for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                
-                # Forward pass - Dual Head Architecture
-                features = encoder(x)
-                features_seq = features.unsqueeze(1)
-                
-                # STGNN head
-                stgnn_logits = stgnn(features_seq)
-                
-                # NeuroSymbolicExplainer head
-                explainer_logits = explainer(features)
-                
-                # Combine both heads (ensemble)
-                logits = (stgnn_logits + explainer_logits) / 2
-                
+                x = x.to(device, non_blocking=is_cuda)
+                y = y.to(device, non_blocking=is_cuda)
+                with (torch.cuda.amp.autocast() if is_cuda else contextlib.nullcontext()):
+                    logits = forward_logits(x)
                 loss = criterion(logits, y)
                 val_loss += loss.item()
                 
                 # Store predictions and probabilities for metrics
                 probs = torch.softmax(logits, dim=1)
-                _, predicted = torch.max(logits.data, 1)
+                predicted = torch.argmax(logits, dim=1)
                 val_predictions.extend(predicted.cpu().numpy())
-                val_labels.extend(y.cpu().numpy())
-                val_probs.extend(probs[:, 1].cpu().numpy())  # Probability of seizure class
+                val_labels.extend(y.detach().cpu().numpy())
+                val_probs.extend(probs[:, 1].detach().cpu().numpy())  # Probability of seizure class
         
         val_loss /= len(val_loader)
         
@@ -371,7 +374,7 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
                 break
     
     # Load best model for testing
-    checkpoint = torch.load('best_model.pth', weights_only=False)
+    checkpoint = torch.load('best_model.pth', map_location=device, weights_only=False)
     encoder.load_state_dict(checkpoint['encoder_state_dict'])
     stgnn.load_state_dict(checkpoint['stgnn_state_dict'])
     explainer.load_state_dict(checkpoint['explainer_state_dict'])
@@ -387,26 +390,16 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
     
     with torch.no_grad():
         for x, y in test_loader:
-            x, y = x.to(device), y.to(device)
-            
-            # Forward pass - Dual Head Architecture
-            features = encoder(x)
-            features_seq = features.unsqueeze(1)
-            
-            # STGNN head
-            stgnn_logits = stgnn(features_seq)
-            
-            # NeuroSymbolicExplainer head
-            explainer_logits = explainer(features)
-            
-            # Combine both heads (ensemble)
-            logits = (stgnn_logits + explainer_logits) / 2
+            x = x.to(device, non_blocking=is_cuda)
+            y = y.to(device, non_blocking=is_cuda)
+            with (torch.cuda.amp.autocast() if is_cuda else contextlib.nullcontext()):
+                logits = forward_logits(x)
             
             probs = torch.softmax(logits, dim=1)
-            _, predicted = torch.max(logits.data, 1)
+            predicted = torch.argmax(logits, dim=1)
             test_predictions.extend(predicted.cpu().numpy())
-            test_labels.extend(y.cpu().numpy())
-            test_probs.extend(probs[:, 1].cpu().numpy())
+            test_labels.extend(y.detach().cpu().numpy())
+            test_probs.extend(probs[:, 1].detach().cpu().numpy())
     
     # Calculate test metrics
     test_f1 = f1_score(test_labels, test_predictions, average='weighted')
@@ -430,6 +423,7 @@ def train_model(data_files, label_files, class_counts, device='cuda', epochs=50,
     return encoder, stgnn, explainer
 
 def main():
+    set_determinism(DEFAULT_SEED)
     # Check if CUDA is available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -449,7 +443,8 @@ def main():
         device=device, 
         epochs=50, 
         batch_size=batch_size,
-        use_focal_loss=use_focal_loss
+        use_focal_loss=use_focal_loss,
+        seed=DEFAULT_SEED
     )
     
     print("\nTraining completed successfully!")
@@ -466,12 +461,14 @@ if __name__ == "__main__":
         class_counts = {0: int((labels==0).sum()), 1: int((labels==1).sum())}
         print(f"Using small dataset: {class_counts}")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        set_determinism(DEFAULT_SEED)
         encoder, stgnn, explainer = train_model(
             data_files, label_files, class_counts,
             device=device,
             epochs=20,
             batch_size=8,
-            use_focal_loss=False
+            use_focal_loss=False,
+            seed=DEFAULT_SEED
         )
         print("\nSmall dataset training completed!")
     else:

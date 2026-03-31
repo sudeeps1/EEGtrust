@@ -1,5 +1,5 @@
 import os
-from eegtrust.config import EEG_DATA_ROOT, SAMPLE_RATE, WINDOW_SIZE_SAMPLES, STRIDE_SAMPLES
+from eegtrust.config import EEG_DATA_ROOT, SAMPLE_RATE, WINDOW_SIZE_SAMPLES, STRIDE_SAMPLES, ENCODER_HIDDEN_DIM
 from eegtrust.metadata import parse_seizure_summary
 from eegtrust.data import load_eeg_data
 from eegtrust.model import SSLPretrainedEncoder, STGNN, NeuroSymbolicExplainer
@@ -22,8 +22,8 @@ data, labels = load_eeg_data(edf_path, seizure_intervals, SAMPLE_RATE)
 # Instantiate model (random weights for demo)
 input_channels = data.shape[0]
 encoder = SSLPretrainedEncoder(input_channels, WINDOW_SIZE_SAMPLES)
-stgnn = STGNN(encoder.encoder[-2].out_features)
-explainer = NeuroSymbolicExplainer(2)
+stgnn = STGNN(ENCODER_HIDDEN_DIM)
+explainer = NeuroSymbolicExplainer(ENCODER_HIDDEN_DIM)
 
 # Compose model pipeline
 import torch
@@ -35,10 +35,10 @@ class SeizureModel(torch.nn.Module):
         self.explainer = explainer
     def forward(self, x):
         feats = self.encoder(x)
-        feats = feats.unsqueeze(1)
-        out = self.stgnn(feats)
-        logits = self.explainer(out)
-        return logits
+        feats_seq = feats.unsqueeze(1)
+        stgnn_logits = self.stgnn(feats_seq)
+        explainer_logits = self.explainer(feats)
+        return (stgnn_logits + explainer_logits) / 2
 
 model = SeizureModel(encoder, stgnn, explainer)
 model.eval()

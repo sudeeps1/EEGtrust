@@ -2,6 +2,7 @@ import numpy as np
 from scipy.signal import welch
 from scipy.stats import entropy as scipy_entropy
 from .config import BANDPOWER_BANDS, SAMPLE_RATE
+from sklearn.metrics import roc_auc_score, confusion_matrix
 
 
 def compute_bandpower(data: np.ndarray, band: tuple, sfreq: int = SAMPLE_RATE) -> float:
@@ -45,5 +46,22 @@ def compute_features(window: np.ndarray, sfreq: int = SAMPLE_RATE) -> np.ndarray
     return np.array(feats)
 
 def compute_metrics(y_true, y_pred):
-    # TODO: Compute AUC, sensitivity, specificity, false alarm rate, latency
-    pass 
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred)
+    y_bin = (y_pred >= 0.5).astype(int) if y_pred.dtype.kind in {'f', 'c'} else y_pred.astype(int)
+
+    cm = confusion_matrix(y_true, y_bin, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    false_alarm_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+    metrics = {
+        "sensitivity": float(sensitivity),
+        "specificity": float(specificity),
+        "false_alarm_rate": float(false_alarm_rate),
+        "confusion_matrix": cm.tolist(),
+    }
+    if np.unique(y_true).size > 1 and y_pred.dtype.kind in {'f', 'c'}:
+        metrics["auc"] = float(roc_auc_score(y_true, y_pred))
+    return metrics

@@ -8,14 +8,23 @@ import torch
 
 def real_time_inference(model, stream, buffer_seconds=10, window_size=2, stride=1, sfreq=256):
     buffer = deque(maxlen=int(buffer_seconds * sfreq))
+    alerts = []
     for chunk in stream:
         buffer.extend(chunk)
-        # Preprocess buffer (normalize, filter, etc.)
-        # Segment buffer into windows
-        # Predict per window
-        # Post-process (majority voting, smoothing)
-        # Trigger alert if needed
-        pass 
+        if len(buffer) < int(window_size * sfreq):
+            continue
+        buffer_arr = np.asarray(buffer, dtype=np.float32)
+        if buffer_arr.ndim == 1:
+            buffer_arr = buffer_arr[np.newaxis, :]
+        alerts.extend(
+            stream_eeg(
+                data=buffer_arr,
+                model=model,
+                window_size=int(window_size * sfreq),
+                stride=int(stride * sfreq),
+            )
+        )
+    return alerts
 
 def stream_eeg(data: np.ndarray, model, window_size: int, stride: int, threshold: float = 0.5):
     """
@@ -31,13 +40,15 @@ def stream_eeg(data: np.ndarray, model, window_size: int, stride: int, threshold
     """
     alerts = []
     windows = sliding_window(data, window_size, stride)
+    device = next(model.parameters()).device
     for i, window in enumerate(windows):
-        feats = compute_features(window)
-        feats_tensor = np.expand_dims(feats, 0)  # batch dim
-        # Assume model returns logits or probabilities
+        window_tensor = np.expand_dims(window, 0)  # batch, channels, samples
         with torch.no_grad():
-            prob = model(torch.tensor(feats_tensor, dtype=torch.float32)).softmax(-1)[0,1].item()
+            window_t = torch.from_numpy(window_tensor).to(device=device, dtype=torch.float32, non_blocking=True)
+            logits = model(window_t)
+            prob = torch.softmax(logits, dim=-1)[0, 1].item()
         if prob > threshold:
+            feats = compute_features(window)
             explanation = symbolic_explanation(feats)
             alert = f"Seizure forecasted at window {i} (p={prob:.2f})"
             # Trigger mock webhook (placeholder)

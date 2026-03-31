@@ -29,7 +29,21 @@ import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eegtrust.model import SSLPretrainedEncoder, STGNN, NeuroSymbolicExplainer
-from eegtrust.config import SAMPLE_RATE, WINDOW_SIZE_SAMPLES, STRIDE_SAMPLES
+from eegtrust.config import WINDOW_SIZE_SAMPLES
+
+
+def _to_serializable(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_serializable(v) for v in value]
+    return value
 
 class AccuracyTester:
     """Comprehensive accuracy testing for the seizure detection system"""
@@ -112,41 +126,37 @@ class AccuracyTester:
         # Normalize (z-score per channel)
         mean = np.mean(eeg_window, axis=1, keepdims=True)
         std = np.std(eeg_window, axis=1, keepdims=True)
-        normalized = (eeg_window - mean) / (std + 1e-8)
+        normalized = ((eeg_window - mean) / (std + 1e-8)).astype(np.float32, copy=False)
         
         # Convert to tensor
-        tensor = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).to(self.device)
+        tensor = torch.from_numpy(normalized).unsqueeze(0).to(self.device)
         return tensor
     
-    def predict_batch(self, windows: np.ndarray) -> tuple:
+    def predict_batch(self, windows: np.ndarray, batch_size: int = 64) -> tuple:
         """Predict on a batch of windows"""
         predictions = []
         confidences = []
         
-        for i, window in enumerate(windows):
+        for i in range(0, len(windows), batch_size):
             if i % 1000 == 0:
                 print(f"Processing window {i}/{len(windows)}")
-            
-            # Preprocess
-            input_tensor = self.preprocess_window(window)
-            
-            # Run inference
-            with torch.no_grad():
+            batch = windows[i:i + batch_size]
+            mean = np.mean(batch, axis=2, keepdims=True)
+            std = np.std(batch, axis=2, keepdims=True)
+            normalized = ((batch - mean) / (std + 1e-8)).astype(np.float32, copy=False)
+            input_tensor = torch.from_numpy(normalized).to(self.device)
+            with torch.inference_mode():
                 features = self.encoder(input_tensor)
                 features_seq = features.unsqueeze(1)
                 stgnn_logits = self.stgnn(features_seq)
                 explainer_logits = self.explainer(features)
                 logits = (stgnn_logits + explainer_logits) / 2
                 
-                # Get probabilities
                 probs = torch.softmax(logits, dim=1)
-                seizure_prob = probs[0, 1].item()
-                
-                # Get prediction
-                prediction = 1 if seizure_prob > 0.5 else 0
-                
-                predictions.append(prediction)
-                confidences.append(seizure_prob)
+                seizure_probs = probs[:, 1].cpu().numpy()
+                preds = (seizure_probs > 0.5).astype(np.int64)
+                predictions.extend(preds.tolist())
+                confidences.extend(seizure_probs.tolist())
         
         return np.array(predictions), np.array(confidences)
     
@@ -163,7 +173,7 @@ class AccuracyTester:
         
         # Confusion matrix
         cm = confusion_matrix(y_true, y_pred)
-        metrics['confusion_matrix'] = cm
+        metrics['confusion_matrix'] = cm.tolist()
         metrics['tn'], metrics['fp'], metrics['fn'], metrics['tp'] = cm.ravel()
         
         # Additional metrics
@@ -349,7 +359,7 @@ class AccuracyTester:
         }
         
         with open(os.path.join(output_dir, 'results.json'), 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(_to_serializable(results), f, indent=2)
         
         # Print summary
         print("\n=== ACCURACY EVALUATION RESULTS ===")

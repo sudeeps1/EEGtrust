@@ -54,8 +54,13 @@ def get_chbmit_metadata():
     return pd.DataFrame(meta)
 
 def filter_pediatric(metadata_df):
-    # TODO: Filter metadata for pediatric subjects
-    pass
+    if metadata_df is None or metadata_df.empty:
+        return metadata_df
+    if 'age' not in metadata_df.columns:
+        return metadata_df
+    age_numeric = pd.to_numeric(metadata_df['age'], errors='coerce')
+    pediatric_mask = age_numeric.isna() | (age_numeric < 18)
+    return metadata_df[pediatric_mask].reset_index(drop=True)
 
 def preprocess_eeg(raw, resample_freq=SAMPLE_RATE):
     # Normalize, resample, band-pass filter
@@ -68,8 +73,12 @@ def preprocess_eeg(raw, resample_freq=SAMPLE_RATE):
     return raw
 
 def remove_artifacts(raw):
-    # TODO: Implement ICA or threshold-based artifact removal
-    pass 
+    cleaned = raw.copy()
+    data = cleaned.get_data()
+    channel_std = np.std(data, axis=1, keepdims=True) + 1e-8
+    clipped = np.clip(data, -5 * channel_std, 5 * channel_std)
+    cleaned._data = clipped.astype(np.float32)
+    return cleaned
 
 def load_eeg_data_chunked(edf_path: str, seizure_intervals: List[Tuple[int, int]],
                         sample_rate: int = SAMPLE_RATE, chunk_size: int = 1_000_000,

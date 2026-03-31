@@ -11,16 +11,11 @@ Integration Testing Script for EEGTrust Seizure Detection System
 import numpy as np
 import torch
 import time
-import threading
-import queue
 import matplotlib.pyplot as plt
-import pandas as pd
 import os
 import sys
 import json
-from datetime import datetime, timedelta
-import subprocess
-import signal
+from datetime import datetime
 import psutil
 
 # Add the parent directory to the path
@@ -28,6 +23,20 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eegtrust.realtime import RealTimeSeizureDetector, OptimizedSeizureDetector
 from eegtrust.config import SAMPLE_RATE, WINDOW_SIZE_SAMPLES
+
+
+def _to_serializable(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_serializable(v) for v in value]
+    return value
 
 class IntegrationTester:
     """Integration testing for the complete EEGTrust system"""
@@ -414,6 +423,7 @@ class IntegrationTester:
     
     def run_full_integration_test(self, output_dir: str = "integration_test_results"):
         """Run complete integration testing"""
+        os.makedirs(output_dir, exist_ok=True)
         print("=== EEGTrust Integration Testing ===")
         start_time = time.time()
         
@@ -450,7 +460,7 @@ class IntegrationTester:
         
         # Save results
         with open(os.path.join(output_dir, 'results.json'), 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(_to_serializable(results), f, indent=2)
         
         # Print summary
         print("\n=== INTEGRATION TEST RESULTS ===")

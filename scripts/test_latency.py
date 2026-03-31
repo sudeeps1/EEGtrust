@@ -12,24 +12,32 @@ import numpy as np
 import torch
 import time
 import psutil
-import threading
-import queue
 import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
 import os
 import sys
 from datetime import datetime
 import json
-from collections import deque
-import statistics
 
 # Add the parent directory to the path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eegtrust.model import SSLPretrainedEncoder, STGNN, NeuroSymbolicExplainer
-from eegtrust.config import SAMPLE_RATE, WINDOW_SIZE_SAMPLES, STRIDE_SAMPLES
-from eegtrust.realtime import OptimizedSeizureDetector, CircularBuffer
+from eegtrust.config import SAMPLE_RATE, WINDOW_SIZE_SAMPLES
+from eegtrust.realtime import CircularBuffer
+
+
+def _to_serializable(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_serializable(v) for v in value]
+    return value
 
 class LatencyTester:
     """Comprehensive latency testing for the seizure detection system"""
@@ -45,6 +53,7 @@ class LatencyTester:
         self.latency_results = []
         self.throughput_results = []
         self.memory_results = []
+        self._warmed_up = False
         
     def load_model(self):
         """Load the trained model"""
@@ -104,29 +113,34 @@ class LatencyTester:
         # Normalize (z-score per channel)
         mean = np.mean(eeg_window, axis=1, keepdims=True)
         std = np.std(eeg_window, axis=1, keepdims=True)
-        normalized = (eeg_window - mean) / (std + 1e-8)
+        normalized = ((eeg_window - mean) / (std + 1e-8)).astype(np.float32, copy=False)
         
         # Convert to tensor
-        tensor = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).to(self.device)
+        tensor = torch.from_numpy(normalized).unsqueeze(0).to(self.device)
         return tensor
-    
-    def measure_single_inference(self, eeg_window: np.ndarray) -> dict:
-        """Measure latency for a single inference"""
-        # Warm up
-        for _ in range(3):
-            input_tensor = self.preprocess_window(eeg_window)
-            with torch.no_grad():
+
+    def _warmup_once(self, eeg_window: np.ndarray):
+        if self._warmed_up:
+            return
+        input_tensor = self.preprocess_window(eeg_window)
+        with torch.inference_mode():
+            for _ in range(3):
                 features = self.encoder(input_tensor)
                 features_seq = features.unsqueeze(1)
                 stgnn_logits = self.stgnn(features_seq)
                 explainer_logits = self.explainer(features)
-                logits = (stgnn_logits + explainer_logits) / 2
+                _ = (stgnn_logits + explainer_logits) / 2
+        self._warmed_up = True
+    
+    def measure_single_inference(self, eeg_window: np.ndarray) -> dict:
+        """Measure latency for a single inference"""
+        self._warmup_once(eeg_window)
         
         # Measure inference time
         start_time = time.time()
         input_tensor = self.preprocess_window(eeg_window)
         
-        with torch.no_grad():
+        with torch.inference_mode():
             features = self.encoder(input_tensor)
             features_seq = features.unsqueeze(1)
             stgnn_logits = self.stgnn(features_seq)
@@ -163,20 +177,13 @@ class LatencyTester:
                 
                 start_time = time.time()
                 
-                # Process batch
-                batch_tensors = []
-                for window in batch:
-                    tensor = self.preprocess_window(window)
-                    batch_tensors.append(tensor)
-                
-                # Stack tensors
-                if len(batch_tensors) > 1:
-                    batch_tensor = torch.cat(batch_tensors, dim=0)
-                else:
-                    batch_tensor = batch_tensors[0]
+                mean = np.mean(batch, axis=2, keepdims=True)
+                std = np.std(batch, axis=2, keepdims=True)
+                normalized = ((batch - mean) / (std + 1e-8)).astype(np.float32, copy=False)
+                batch_tensor = torch.from_numpy(normalized).to(self.device)
                 
                 # Run inference
-                with torch.no_grad():
+                with torch.inference_mode():
                     features = self.encoder(batch_tensor)
                     features_seq = features.unsqueeze(1)
                     stgnn_logits = self.stgnn(features_seq)
@@ -413,6 +420,7 @@ class LatencyTester:
     
     def run_full_latency_evaluation(self, output_dir: str = "latency_test_results"):
         """Run complete latency evaluation"""
+        os.makedirs(output_dir, exist_ok=True)
         print("=== EEGTrust Latency Evaluation ===")
         start_time = time.time()
         
@@ -467,7 +475,7 @@ class LatencyTester:
         
         # Save results
         with open(os.path.join(output_dir, 'results.json'), 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(_to_serializable(results), f, indent=2)
         
         # Print summary
         print("\n=== LATENCY EVALUATION RESULTS ===")

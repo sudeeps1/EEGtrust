@@ -11,23 +11,19 @@ Real-Time Seizure Detection System
 
 import numpy as np
 import torch
-import torch.nn as nn
 import time
 import threading
 import queue
 import json
 import os
-from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict
 from collections import deque
 import logging
 from dataclasses import dataclass
-import asyncio
-import aiofiles
 
 # Import our trained models
 from .model import SSLPretrainedEncoder, STGNN, NeuroSymbolicExplainer
-from .config import SAMPLE_RATE, WINDOW_SIZE_SAMPLES, STRIDE_SAMPLES
+from .config import SAMPLE_RATE, WINDOW_SIZE_SAMPLES
 
 @dataclass
 class SeizureAlert:
@@ -161,6 +157,8 @@ class OptimizedSeizureDetector:
         
         # Warm up the model
         self._warmup()
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
     
     def load_model(self):
         """Load the trained model from checkpoint"""
@@ -198,21 +196,27 @@ class OptimizedSeizureDetector:
         # Normalize (z-score per channel)
         mean = np.mean(eeg_window, axis=1, keepdims=True)
         std = np.std(eeg_window, axis=1, keepdims=True)
-        normalized = (eeg_window - mean) / (std + 1e-8)
+        normalized = ((eeg_window - mean) / (std + 1e-8)).astype(np.float32, copy=False)
         
         # Convert to tensor
-        tensor = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).to(self.device)
+        tensor = torch.from_numpy(normalized).unsqueeze(0).to(self.device)
         return tensor
     
     def predict(self, eeg_window: np.ndarray) -> ModelPrediction:
         """Run inference on EEG window"""
         start_time = time.time()
+        if eeg_window.ndim != 2 or eeg_window.shape[0] != self.num_channels or eeg_window.shape[1] != self.window_samples:
+            raise ValueError(
+                f"Invalid EEG window shape {eeg_window.shape}, expected ({self.num_channels}, {self.window_samples})"
+            )
+        if not np.isfinite(eeg_window).all():
+            raise ValueError("EEG window contains NaN or infinite values")
         
         # Preprocess
         input_tensor = self.preprocess_window(eeg_window)
         
         # Run inference
-        with torch.no_grad():
+        with torch.inference_mode():
             features = self.encoder(input_tensor)
             features_seq = features.unsqueeze(1)
             stgnn_logits = self.stgnn(features_seq)
@@ -235,7 +239,7 @@ class OptimizedSeizureDetector:
             confidence=seizure_prob,
             prediction=prediction,
             eeg_window=eeg_window.copy(),
-            features=features.cpu().numpy()
+            features=None
         )
     
     def get_average_inference_time(self) -> float:
@@ -267,6 +271,8 @@ class SeizureAlertManager:
     def process_prediction(self, prediction: ModelPrediction) -> Optional[SeizureAlert]:
         """Process a new prediction and potentially trigger an alert"""
         self.total_predictions += 1
+        if prediction.confidence > self.confidence_threshold:
+            self.positive_predictions += 1
         
         # Add to recent predictions
         self.recent_predictions.append(prediction)
@@ -315,6 +321,7 @@ class ExplanationGenerator:
         self.explanation_queue = queue.Queue()
         self.explanation_thread = None
         self.running = False
+        self._freq_cache = {}
     
     def start(self):
         """Start the explanation generation thread"""
@@ -345,27 +352,29 @@ class ExplanationGenerator:
     def _extract_eeg_features(self, eeg_window: np.ndarray) -> Dict:
         """Extract relevant EEG features for explanation"""
         features = {}
-        
-        # Calculate power in different frequency bands
-        from scipy import signal
+        n_samples = eeg_window.shape[1]
+        cache_key = (n_samples, SAMPLE_RATE)
+        if cache_key in self._freq_cache:
+            freqs, masks = self._freq_cache[cache_key]
+        else:
+            freqs = np.fft.rfftfreq(n_samples, 1 / SAMPLE_RATE)
+            masks = {
+                'delta': (freqs >= 0.5) & (freqs <= 4),
+                'theta': (freqs >= 4) & (freqs <= 8),
+                'alpha': (freqs >= 8) & (freqs <= 13),
+                'beta': (freqs >= 13) & (freqs <= 30),
+                'gamma': (freqs >= 30) & (freqs <= 70),
+            }
+            self._freq_cache[cache_key] = (freqs, masks)
         
         for ch in range(min(5, eeg_window.shape[0])):  # Use first 5 channels
             # FFT
-            fft_vals = np.abs(np.fft.fft(eeg_window[ch]))
-            freqs = np.fft.fftfreq(len(eeg_window[ch]), 1/SAMPLE_RATE)
-            
-            # Power in different bands
-            delta_mask = (freqs >= 0.5) & (freqs <= 4)
-            theta_mask = (freqs >= 4) & (freqs <= 8)
-            alpha_mask = (freqs >= 8) & (freqs <= 13)
-            beta_mask = (freqs >= 13) & (freqs <= 30)
-            gamma_mask = (freqs >= 30) & (freqs <= 70)
-            
-            features[f'ch{ch}_delta_power'] = np.mean(fft_vals[delta_mask])
-            features[f'ch{ch}_theta_power'] = np.mean(fft_vals[theta_mask])
-            features[f'ch{ch}_alpha_power'] = np.mean(fft_vals[alpha_mask])
-            features[f'ch{ch}_beta_power'] = np.mean(fft_vals[beta_mask])
-            features[f'ch{ch}_gamma_power'] = np.mean(fft_vals[gamma_mask])
+            fft_vals = np.abs(np.fft.rfft(eeg_window[ch]))
+            features[f'ch{ch}_delta_power'] = np.mean(fft_vals[masks['delta']])
+            features[f'ch{ch}_theta_power'] = np.mean(fft_vals[masks['theta']])
+            features[f'ch{ch}_alpha_power'] = np.mean(fft_vals[masks['alpha']])
+            features[f'ch{ch}_beta_power'] = np.mean(fft_vals[masks['beta']])
+            features[f'ch{ch}_gamma_power'] = np.mean(fft_vals[masks['gamma']])
         
         # Overall statistics
         features['mean_amplitude'] = np.mean(np.abs(eeg_window))

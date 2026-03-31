@@ -72,7 +72,7 @@ class STGNN(nn.Module):
     def __init__(self, input_dim, num_layers=2, num_heads=4):
         super().__init__()
         self.layers = nn.ModuleList([
-            nn.MultiheadAttention(input_dim, num_heads) for _ in range(num_layers)
+            nn.MultiheadAttention(input_dim, num_heads, batch_first=True) for _ in range(num_layers)
         ])
         self.fc = nn.Linear(input_dim, 2)  # seizure/non-seizure
 

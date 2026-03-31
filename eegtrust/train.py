@@ -10,9 +10,10 @@ from .model import EEGMetaNet, SSLPretrainedEncoder, STGNN, NeuroSymbolicExplain
 from .data import get_chbmit_subjects, load_eeg_data, preprocess_eeg, get_chbmit_metadata
 from .segment import segment_eeg
 from .metadata import extract_metadata, encode_metadata
-from .config import WINDOW_SIZE, WINDOW_STRIDE, SAMPLING_FREQ
+from .config import WINDOW_SIZE_SAMPLES, STRIDE_SAMPLES, SAMPLE_RATE
 import os
 from .utils import compute_features
+import contextlib
 
 # TODO: Implement EEGDataset class and data loading
 class EEGDataset(Dataset):
@@ -79,6 +80,10 @@ def nt_xent_loss(z1, z2, temperature=0.5):
     return loss
 
 def prepare_data():
+    raise NotImplementedError(
+        "Legacy training path is deprecated. Use scripts/train_with_existing_data.py "
+        "or adapt prepare_data() to your local CHB-MIT layout."
+    )
     subjects = get_chbmit_subjects()
     metadata_df = get_chbmit_metadata()
     X_eeg, X_meta, y, groups = [], [], [], []
@@ -88,8 +93,8 @@ def prepare_data():
         edf_files = [f for f in os.listdir(f'../data/raw/{subj_dir}') if f.endswith('.edf')]
         for edf_file in edf_files:
             raw, labels = load_eeg_data(subj, edf_file)
-            raw = preprocess_eeg(raw, SAMPLING_FREQ)
-            segs, seg_labels = segment_eeg(raw, WINDOW_SIZE, WINDOW_STRIDE, labels, SAMPLING_FREQ)
+            raw = preprocess_eeg(raw, SAMPLE_RATE)
+            segs, seg_labels = segment_eeg(raw, WINDOW_SIZE_SAMPLES, STRIDE_SAMPLES, labels, SAMPLE_RATE)
             meta_vec = encode_metadata(subj_meta)
             X_eeg.append(segs)
             X_meta.append(np.tile(meta_vec, (len(segs), 1)))
@@ -167,20 +172,30 @@ def train_ssl_encoder(encoder: SSLPretrainedEncoder, windows: np.ndarray, batch_
     """
     encoder = encoder.to(device)
     dataset = EEGSimCLRDataset(windows, eeg_augment)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    is_cuda = str(device).startswith("cuda")
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        pin_memory=is_cuda,
+    )
     optimizer = optim.Adam(encoder.parameters(), lr=1e-3)
+    scaler = torch.cuda.amp.GradScaler(enabled=is_cuda)
     for epoch in range(epochs):
         encoder.train()
         total_loss = 0
         for aug1, aug2 in tqdm(dataloader, desc=f'SSL Epoch {epoch+1}/{epochs}'):
-            aug1 = torch.tensor(aug1, dtype=torch.float32).to(device)
-            aug2 = torch.tensor(aug2, dtype=torch.float32).to(device)
-            z1 = encoder(aug1)
-            z2 = encoder(aug2)
-            loss = nt_xent_loss(z1, z2)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            aug1 = aug1.to(device=device, dtype=torch.float32, non_blocking=is_cuda)
+            aug2 = aug2.to(device=device, dtype=torch.float32, non_blocking=is_cuda)
+            optimizer.zero_grad(set_to_none=True)
+            with (torch.cuda.amp.autocast() if is_cuda else contextlib.nullcontext()):
+                z1 = encoder(aug1)
+                z2 = encoder(aug2)
+                loss = nt_xent_loss(z1, z2)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total_loss += loss.item() * aug1.size(0)
         avg_loss = total_loss / len(dataset)
         print(f'Epoch {epoch+1}: SSL Loss = {avg_loss:.4f}')
@@ -204,26 +219,30 @@ def train_seizure_model(encoder: SSLPretrainedEncoder, stgnn: STGNN, explainer: 
     stgnn = stgnn.to(device)
     explainer = explainer.to(device)
     dataset = EEGWindowDataset(windows, labels)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    is_cuda = str(device).startswith("cuda")
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=is_cuda)
     params = list(encoder.parameters()) + list(stgnn.parameters()) + list(explainer.parameters())
     optimizer = optim.Adam(params, lr=1e-3)
     criterion = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler(enabled=is_cuda)
     for epoch in range(epochs):
         encoder.train()
         stgnn.train()
         explainer.train()
         total_loss = 0
         for x, y in tqdm(dataloader, desc=f'Supervised Epoch {epoch+1}/{epochs}'):
-            x = torch.tensor(x, dtype=torch.float32).to(device)
-            y = torch.tensor(y, dtype=torch.long).to(device)
-            feats = encoder(x)  # (batch, hidden_dim)
-            feats_seq = feats.unsqueeze(1)  # (batch, seq_len=1, hidden_dim)
-            logits = stgnn(feats_seq)  # (batch, 2)
-            logits = explainer(logits)  # (batch, 2)
-            loss = criterion(logits, y)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            x = x.to(device=device, dtype=torch.float32, non_blocking=is_cuda)
+            y = y.to(device=device, dtype=torch.long, non_blocking=is_cuda)
+            optimizer.zero_grad(set_to_none=True)
+            with (torch.cuda.amp.autocast() if is_cuda else contextlib.nullcontext()):
+                feats = encoder(x)  # (batch, hidden_dim)
+                feats_seq = feats.unsqueeze(1)  # (batch, seq_len=1, hidden_dim)
+                logits = stgnn(feats_seq)  # (batch, 2)
+                logits = explainer(logits)  # (batch, 2)
+                loss = criterion(logits, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total_loss += loss.item() * x.size(0)
         avg_loss = total_loss / len(dataset)
         print(f'Epoch {epoch+1}: Supervised Loss = {avg_loss:.4f}')

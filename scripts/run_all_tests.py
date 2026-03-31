@@ -70,10 +70,15 @@ def run_test_script(script_name: str, description: str) -> dict:
 
 def find_latest_results(test_type: str) -> str:
     """Find the latest results directory for a test type"""
-    base_dir = f"{test_type}_test_results"
+    prefix_map = {
+        "accuracy_testing": "accuracy_test_results_",
+        "latency_testing": "latency_test_results_",
+        "integration_testing": "integration_test_results_",
+    }
+    base_dir = prefix_map.get(test_type, f"{test_type}_test_results_")
     
     # Look for existing directories
-    existing_dirs = [d for d in os.listdir('.') if d.startswith(base_dir)]
+    existing_dirs = [d for d in os.listdir('.') if d.startswith(base_dir) and os.path.isdir(d)]
     
     if not existing_dirs:
         return None
